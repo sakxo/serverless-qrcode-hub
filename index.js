@@ -1,18 +1,449 @@
-let KV_BINDING;
 let DB;
-const banPath = [
-  'login', 'admin', '__total_count',
-  // static files
-  'admin.html', 'login.html',
-  'daisyui@5.css', 'tailwindcss@4.js',
-  'qr-code-styling.js', 'zxing.js',
-  'robots.txt', 'wechat.svg',
-  'favicon.svg',
-];
 
-// 数据库初始化
+const RESERVED_PATHS = new Set([
+  'login',
+  'admin',
+  '__total_count',
+  'admin.html',
+  'login.html',
+  'daisyui@5.css',
+  'tailwindcss@4.js',
+  'qr-code-styling.js',
+  'zxing.js',
+  'robots.txt',
+  'wechat.svg',
+  'favicon.svg',
+]);
+
+const SESSION_COOKIE = 'token';
+const SESSION_MAX_AGE = 60 * 60 * 24;
+const EXPIRING_DAYS = 3;
+const EXPIRED_RETENTION_DAYS = 30;
+const DEFAULT_PAGE_SIZE = 10;
+const MAX_PAGE_SIZE = 100;
+const DEFAULT_WECHAT_ANNOUNCEMENT_HTML = '<p>请长按识别下方二维码</p>';
+const DEFAULT_WECHAT_HINT_HTML = '<p>二维码失效请联系作者更新</p>';
+const RICH_TEXT_TAG_MAP = {
+  a: 'a',
+  b: 'strong',
+  br: 'br',
+  div: 'div',
+  em: 'em',
+  i: 'em',
+  li: 'li',
+  ol: 'ol',
+  p: 'p',
+  span: 'span',
+  strong: 'strong',
+  u: 'u',
+  ul: 'ul',
+};
+
+const SORT_FIELD_MAP = {
+  created_at: 'created_at',
+  updated_at: 'updated_at',
+  expiry: 'expiry',
+  visit_count: 'visit_count',
+  path: 'path',
+  name: 'name',
+};
+
+class AppError extends Error {
+  constructor(message, status = 400, code = 'BAD_REQUEST') {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function json(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json;charset=UTF-8',
+      'Cache-Control': 'no-store',
+      ...headers,
+    },
+  });
+}
+
+function errorResponse(error) {
+  const status = error instanceof AppError ? error.status : 500;
+  const code = error instanceof AppError ? error.code : 'INTERNAL_ERROR';
+  const message = error instanceof Error ? error.message : 'Internal Server Error';
+  return json({ error: message, code }, status);
+}
+
+function getSessionSecret(env) {
+  return env.SESSION_SECRET || env.PASSWORD || 'serverless-qrcode-hub';
+}
+
+function toBase64Url(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+async function hmac(value, secret) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(value));
+  return toBase64Url(signature);
+}
+
+async function createSessionToken(env) {
+  return hmac('admin-session', getSessionSecret(env));
+}
+
+function getCookieValue(cookieHeader, name) {
+  if (!cookieHeader) {
+    return '';
+  }
+  const parts = cookieHeader.split(';');
+  for (const part of parts) {
+    const [key, ...rest] = part.trim().split('=');
+    if (key === name) {
+      return rest.join('=');
+    }
+  }
+  return '';
+}
+
+async function verifyAuthCookie(request, env) {
+  const currentToken = getCookieValue(request.headers.get('Cookie') || '', SESSION_COOKIE);
+  if (!currentToken) {
+    return false;
+  }
+  const expectedToken = await createSessionToken(env);
+  return currentToken === expectedToken;
+}
+
+async function setAuthCookie(env) {
+  const token = await createSessionToken(env);
+  return {
+    'Set-Cookie': `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_MAX_AGE}`,
+  };
+}
+
+function clearAuthCookie() {
+  return {
+    'Set-Cookie': `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`,
+  };
+}
+
+function getChinaDate(dayOffset = 0) {
+  const now = new Date(Date.now() + 8 * 60 * 60 * 1000);
+  now.setUTCHours(0, 0, 0, 0);
+  now.setUTCDate(now.getUTCDate() + dayOffset);
+  return now.toISOString().slice(0, 10);
+}
+
+function normalizePath(value) {
+  return String(value || '').trim().replace(/^\/+/, '');
+}
+
+function normalizeExpiry(value) {
+  if (!value) {
+    return null;
+  }
+  const text = String(value).trim();
+  const dateText = text.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateText)) {
+    throw new AppError('有效日期格式不正确');
+  }
+  const parsed = new Date(`${dateText}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new AppError('有效日期格式不正确');
+  }
+  return dateText;
+}
+
+function normalizeBoolean(value, defaultValue = false) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (value === undefined || value === null || value === '') {
+    return defaultValue;
+  }
+  if (typeof value === 'number') {
+    return value === 1;
+  }
+  if (typeof value === 'string') {
+    return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
+  }
+  return defaultValue;
+}
+
+function assertValidTarget(target) {
+  let parsed;
+  try {
+    parsed = new URL(target);
+  } catch {
+    throw new AppError('目标 URL 不合法');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new AppError('目标 URL 仅支持 http 或 https');
+  }
+}
+
+function sanitizeLinkHref(value) {
+  const href = String(value || '').trim();
+  if (!href) {
+    return '';
+  }
+  if (/^(#|\/(?!\/)|\.\.?(\/|$))/i.test(href)) {
+    return href;
+  }
+  try {
+    const parsed = new URL(href);
+    if (['http:', 'https:', 'mailto:', 'tel:'].includes(parsed.protocol)) {
+      return href;
+    }
+  } catch {
+  }
+  return '';
+}
+
+function sanitizeRichText(value, fallback = '') {
+  const source = String(value || '').trim();
+  if (!source) {
+    return fallback;
+  }
+
+  const tokens = source.matchAll(/<\/?([A-Za-z0-9]+)([^>]*)>/g);
+  const stack = [];
+  let lastIndex = 0;
+  let output = '';
+
+  for (const match of tokens) {
+    output += escapeHtml(source.slice(lastIndex, match.index));
+    lastIndex = match.index + match[0].length;
+
+    const rawTag = String(match[1] || '').toLowerCase();
+    const tag = RICH_TEXT_TAG_MAP[rawTag];
+    if (!tag) {
+      continue;
+    }
+
+    const isClosing = match[0][1] === '/';
+    if (isClosing) {
+      if (tag === 'br') {
+        continue;
+      }
+      if (stack[stack.length - 1] === tag) {
+        stack.pop();
+        output += `</${tag}>`;
+      }
+      continue;
+    }
+
+    if (tag === 'br') {
+      output += '<br>';
+      continue;
+    }
+
+    if (tag === 'a') {
+      const attrs = match[2] || '';
+      const hrefMatch = attrs.match(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i);
+      const safeHref = sanitizeLinkHref(hrefMatch ? (hrefMatch[1] || hrefMatch[2] || hrefMatch[3] || '') : '');
+      if (!safeHref) {
+        continue;
+      }
+      const isExternal = !/^(#|\/|\.\.?(\/|$))/i.test(safeHref) && !/^mailto:|^tel:/i.test(safeHref);
+      output += `<a href="${escapeHtml(safeHref)}"${isExternal ? ' target="_blank" rel="noopener noreferrer"' : ''}>`;
+      stack.push('a');
+      continue;
+    }
+
+    output += `<${tag}>`;
+    stack.push(tag);
+  }
+
+  output += escapeHtml(source.slice(lastIndex));
+
+  while (stack.length > 0) {
+    output += `</${stack.pop()}>`;
+  }
+
+  const normalized = output
+    .replace(/(?:&nbsp;|\u00A0)/g, ' ')
+    .replace(/<div><\/div>/gi, '')
+    .trim();
+
+  return normalized || fallback;
+}
+
+function normalizeMappingPayload(payload, options = {}) {
+  const path = normalizePath(payload.path);
+  const target = String(payload.target || '').trim();
+  const name = String(payload.name || '').trim();
+  const expiry = normalizeExpiry(payload.expiry);
+  const enabled = normalizeBoolean(payload.enabled, true);
+  const isWechat = normalizeBoolean(payload.isWechat, false);
+  const qrCodeData = payload.qrCodeData ? String(payload.qrCodeData).trim() : '';
+  const announcementHtml = sanitizeRichText(payload.announcementHtml || payload.announcement_html || '', '');
+  const hintHtml = sanitizeRichText(payload.hintHtml || payload.hint_html || '', '');
+
+  if (!path) {
+    throw new AppError('短链名不能为空');
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(path)) {
+    throw new AppError('短链名只能包含字母、数字、下划线和横线');
+  }
+  if (RESERVED_PATHS.has(path)) {
+    throw new AppError('该短链名已被系统保留，请使用其他名称');
+  }
+  if (!target) {
+    throw new AppError('目标 URL 不能为空');
+  }
+
+  assertValidTarget(target);
+
+  if (isWechat && !qrCodeData) {
+    throw new AppError('微信二维码必须提供原始二维码数据');
+  }
+
+  const normalized = {
+    path,
+    target,
+    name: name || null,
+    expiry,
+    enabled,
+    isWechat,
+    qrCodeData: isWechat ? qrCodeData : null,
+    announcementHtml: announcementHtml || null,
+    hintHtml: hintHtml || null,
+  };
+
+  if (options.includeMeta) {
+    normalized.visitCount = Number(payload.visitCount || payload.visit_count || 0) || 0;
+    normalized.lastVisitedAt = payload.lastVisitedAt || payload.last_visited_at || null;
+    normalized.createdAt = payload.createdAt || payload.created_at || null;
+    normalized.updatedAt = payload.updatedAt || payload.updated_at || null;
+  }
+
+  return normalized;
+}
+
+function isExpiredDate(expiry) {
+  if (!expiry) {
+    return false;
+  }
+  return expiry.slice(0, 10) < getChinaDate();
+}
+
+function isExpiringDate(expiry) {
+  if (!expiry) {
+    return false;
+  }
+  const dateText = expiry.slice(0, 10);
+  const today = getChinaDate();
+  return dateText >= today && dateText <= getChinaDate(EXPIRING_DAYS);
+}
+
+function getMappingStatus(mapping) {
+  if (!mapping.enabled) {
+    return 'disabled';
+  }
+  if (mapping.expiry && isExpiredDate(mapping.expiry)) {
+    return 'expired';
+  }
+  if (mapping.expiry && isExpiringDate(mapping.expiry)) {
+    return 'expiring';
+  }
+  return 'active';
+}
+
+function serializeMapping(row) {
+  const mapping = {
+    path: row.path,
+    target: row.target,
+    name: row.name || '',
+    expiry: row.expiry ? String(row.expiry).slice(0, 10) : '',
+    enabled: row.enabled === 1 || row.enabled === true,
+    isWechat: row.isWechat === 1 || row.isWechat === true,
+    qrCodeData: row.qrCodeData || '',
+    announcementHtml: row.announcementHtml || row.announcement_html || '',
+    hintHtml: row.hintHtml || row.hint_html || '',
+    visitCount: Number(row.visit_count || row.visitCount || 0) || 0,
+    lastVisitedAt: row.last_visited_at || row.lastVisitedAt || '',
+    createdAt: row.created_at || row.createdAt || '',
+    updatedAt: row.updated_at || row.updatedAt || '',
+  };
+  mapping.status = getMappingStatus(mapping);
+  return mapping;
+}
+
+function parseListParams(searchParams) {
+  const page = Math.max(Number(searchParams.get('page') || DEFAULT_PAGE_SIZE / DEFAULT_PAGE_SIZE) || 1, 1);
+  const pageSize = Math.min(
+    Math.max(Number(searchParams.get('pageSize') || DEFAULT_PAGE_SIZE) || DEFAULT_PAGE_SIZE, 1),
+    MAX_PAGE_SIZE
+  );
+  const query = String(searchParams.get('query') || '').trim().toLowerCase();
+  const status = String(searchParams.get('status') || 'all').trim();
+  const type = String(searchParams.get('type') || 'all').trim();
+  const sortBy = SORT_FIELD_MAP[searchParams.get('sortBy')] ? searchParams.get('sortBy') : 'created_at';
+  const sortOrder = String(searchParams.get('sortOrder') || 'desc').toLowerCase() === 'asc' ? 'asc' : 'desc';
+  return { page, pageSize, query, status, type, sortBy, sortOrder };
+}
+
+function buildFilterQuery(filters) {
+  const where = [`path NOT IN (${Array.from(RESERVED_PATHS).map(() => '?').join(',')})`];
+  const bindings = Array.from(RESERVED_PATHS);
+  const today = getChinaDate();
+  const expiringLimit = getChinaDate(EXPIRING_DAYS);
+
+  if (filters.query) {
+    const keyword = `%${filters.query}%`;
+    where.push(`(
+      lower(path) LIKE ?
+      OR lower(COALESCE(name, '')) LIKE ?
+      OR lower(target) LIKE ?
+    )`);
+    bindings.push(keyword, keyword, keyword);
+  }
+
+  if (filters.type === 'wechat') {
+    where.push('isWechat = 1');
+  } else if (filters.type === 'normal') {
+    where.push('isWechat = 0');
+  }
+
+  if (filters.status === 'active') {
+    where.push('(enabled = 1 AND (expiry IS NULL OR substr(expiry, 1, 10) > ?))');
+    bindings.push(expiringLimit);
+  } else if (filters.status === 'expiring') {
+    where.push('(enabled = 1 AND expiry IS NOT NULL AND substr(expiry, 1, 10) >= ? AND substr(expiry, 1, 10) <= ?)');
+    bindings.push(today, expiringLimit);
+  } else if (filters.status === 'expired') {
+    where.push('(expiry IS NOT NULL AND substr(expiry, 1, 10) < ?)');
+    bindings.push(today);
+  } else if (filters.status === 'disabled') {
+    where.push('(enabled = 0)');
+  }
+
+  return { where: where.join(' AND '), bindings };
+}
+
 async function initDatabase() {
-  // 创建表
   await DB.prepare(`
     CREATE TABLE IF NOT EXISTS mappings (
       path TEXT PRIMARY KEY,
@@ -20,715 +451,635 @@ async function initDatabase() {
       name TEXT,
       expiry TEXT,
       enabled INTEGER DEFAULT 1,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      isWechat INTEGER DEFAULT 0,
+      qrCodeData TEXT,
+      announcementHtml TEXT,
+      hintHtml TEXT,
+      visit_count INTEGER DEFAULT 0,
+      last_visited_at TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
   `).run();
 
-  // 检查是否需要添加新列
-  const tableInfo = await DB.prepare("PRAGMA table_info(mappings)").all();
-  const columns = tableInfo.results.map(col => col.name);
+  const tableInfo = await DB.prepare('PRAGMA table_info(mappings)').all();
+  const columns = new Set((tableInfo.results || []).map((column) => column.name));
 
-  // 添加 isWechat 列（如果不存在）
-  if (!columns.includes('isWechat')) {
+  if (!columns.has('isWechat')) {
+    await DB.prepare('ALTER TABLE mappings ADD COLUMN isWechat INTEGER DEFAULT 0').run();
+  }
+  if (!columns.has('qrCodeData')) {
+    await DB.prepare('ALTER TABLE mappings ADD COLUMN qrCodeData TEXT').run();
+  }
+  if (!columns.has('announcementHtml')) {
+    await DB.prepare('ALTER TABLE mappings ADD COLUMN announcementHtml TEXT').run();
+  }
+  if (!columns.has('hintHtml')) {
+    await DB.prepare('ALTER TABLE mappings ADD COLUMN hintHtml TEXT').run();
+  }
+  if (!columns.has('visit_count')) {
+    await DB.prepare('ALTER TABLE mappings ADD COLUMN visit_count INTEGER DEFAULT 0').run();
+  }
+  if (!columns.has('last_visited_at')) {
+    await DB.prepare('ALTER TABLE mappings ADD COLUMN last_visited_at TEXT').run();
+  }
+  if (!columns.has('updated_at')) {
+    await DB.prepare('ALTER TABLE mappings ADD COLUMN updated_at TEXT').run();
+  }
+
+  await DB.prepare(`
+    UPDATE mappings
+    SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP)
+    WHERE updated_at IS NULL OR updated_at = ''
+  `).run();
+
+  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_expiry ON mappings(expiry)').run();
+  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_created_at ON mappings(created_at)').run();
+  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_updated_at ON mappings(updated_at)').run();
+  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_enabled_expiry ON mappings(enabled, expiry)').run();
+  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_visit_count ON mappings(visit_count)').run();
+  await DB.prepare('CREATE INDEX IF NOT EXISTS idx_mappings_is_wechat ON mappings(isWechat)').run();
+}
+
+async function getMappingByPath(path) {
+  const mapping = await DB.prepare(`
+    SELECT path, target, name, expiry, enabled, isWechat, qrCodeData, announcementHtml, hintHtml, visit_count, last_visited_at, created_at, updated_at
+    FROM mappings
+    WHERE path = ?
+  `).bind(path).first();
+  return mapping ? serializeMapping(mapping) : null;
+}
+
+async function ensurePathAvailable(path, originalPath = '') {
+  const existing = await DB.prepare('SELECT path FROM mappings WHERE path = ?').bind(path).first();
+  if (existing && existing.path !== originalPath) {
+    throw new AppError('短链名已存在', 409, 'PATH_CONFLICT');
+  }
+}
+
+async function createMapping(payload, options = {}) {
+  const mapping = normalizeMappingPayload(payload, { includeMeta: options.includeMeta });
+  await ensurePathAvailable(mapping.path);
+
+  if (options.includeMeta) {
     await DB.prepare(`
-      ALTER TABLE mappings 
-      ADD COLUMN isWechat INTEGER DEFAULT 0
-    `).run();
-  }
-
-  // 添加 qrCodeData 列（如果不存在）
-  if (!columns.includes('qrCodeData')) {
+      INSERT INTO mappings (
+        path, target, name, expiry, enabled, isWechat, qrCodeData, announcementHtml, hintHtml,
+        visit_count, last_visited_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      mapping.path,
+      mapping.target,
+      mapping.name,
+      mapping.expiry,
+      mapping.enabled ? 1 : 0,
+      mapping.isWechat ? 1 : 0,
+      mapping.qrCodeData,
+      mapping.announcementHtml,
+      mapping.hintHtml,
+      mapping.visitCount,
+      mapping.lastVisitedAt,
+      mapping.createdAt || new Date().toISOString(),
+      mapping.updatedAt || mapping.createdAt || new Date().toISOString()
+    ).run();
+  } else {
     await DB.prepare(`
-      ALTER TABLE mappings 
-      ADD COLUMN qrCodeData TEXT
-    `).run();
+      INSERT INTO mappings (path, target, name, expiry, enabled, isWechat, qrCodeData, announcementHtml, hintHtml, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      mapping.path,
+      mapping.target,
+      mapping.name,
+      mapping.expiry,
+      mapping.enabled ? 1 : 0,
+      mapping.isWechat ? 1 : 0,
+      mapping.qrCodeData,
+      mapping.announcementHtml,
+      mapping.hintHtml,
+      new Date().toISOString()
+    ).run();
   }
 
-  // 添加索引
-  await DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_expiry ON mappings(expiry)
-  `).run();
-
-  await DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_created_at ON mappings(created_at)
-  `).run();
-
-  // 组合索引：用于启用状态和过期时间的组合查询
-  await DB.prepare(`
-    CREATE INDEX IF NOT EXISTS idx_enabled_expiry ON mappings(enabled, expiry)
-  `).run();
+  return getMappingByPath(mapping.path);
 }
 
-// Cookie 相关函数
-function verifyAuthCookie(request, env) {
-  const cookie = request.headers.get('Cookie') || '';
-  const authToken = cookie.split(';').find(c => c.trim().startsWith('token='));
-  if (!authToken) return false;
-  return authToken.split('=')[1].trim() === env.PASSWORD;
-}
-
-function setAuthCookie(password) {
-  return {
-    'Set-Cookie': `token=${password}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400`,
-    'Content-Type': 'application/json'
-  };
-}
-
-function clearAuthCookie() {
-  return {
-    'Set-Cookie': 'token=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0',
-    'Content-Type': 'application/json'
-  };
-}
-
-// 数据库操作相关函数
-async function listMappings(page = 1, pageSize = 10) {
-  const offset = (page - 1) * pageSize;
-  
-  // 使用单个查询获取分页数据和总数
-  const results = await DB.prepare(`
-    WITH filtered_mappings AS (
-      SELECT * FROM mappings 
-      WHERE path NOT IN (${banPath.map(() => '?').join(',')})
-    )
-    SELECT 
-      filtered.*,
-      (SELECT COUNT(*) FROM filtered_mappings) as total_count
-    FROM filtered_mappings as filtered
-    ORDER BY created_at DESC
-    LIMIT ? OFFSET ?
-  `).bind(...banPath, pageSize, offset).all();
-
-  if (!results.results || results.results.length === 0) {
-    return {
-      mappings: {},
-      total: 0,
-      page,
-      pageSize,
-      totalPages: 0
-    };
+async function updateMapping(payload) {
+  const originalPath = normalizePath(payload.originalPath);
+  if (!originalPath) {
+    throw new AppError('原短链名不能为空');
   }
 
-  const total = results.results[0].total_count;
-  const mappings = {};
-
-  for (const row of results.results) {
-    mappings[row.path] = {
-      target: row.target,
-      name: row.name,
-      expiry: row.expiry,
-      enabled: row.enabled === 1,
-      isWechat: row.isWechat === 1,
-      qrCodeData: row.qrCodeData
-    };
+  const current = await getMappingByPath(originalPath);
+  if (!current) {
+    throw new AppError('映射不存在', 404, 'NOT_FOUND');
   }
 
-  return {
-    mappings,
-    total,
-    page,
-    pageSize,
-    totalPages: Math.ceil(total / pageSize)
-  };
-}
+  const mapping = normalizeMappingPayload(payload);
+  await ensurePathAvailable(mapping.path, originalPath);
 
-async function createMapping(path, target, name, expiry, enabled = true, isWechat = false, qrCodeData = null) {
-  if (!path || !target || typeof path !== 'string' || typeof target !== 'string') {
-    throw new Error('Invalid input');
-  }
+  const qrCodeData = mapping.isWechat
+    ? (mapping.qrCodeData || current.qrCodeData || null)
+    : null;
 
-  // 检查短链名是否在禁用列表中
-  if (banPath.includes(path)) {
-    throw new Error('该短链名已被系统保留，请使用其他名称');
-  }
-
-  if (expiry && isNaN(Date.parse(expiry))) {
-    throw new Error('Invalid expiry date');
-  }
-
-  // 如果是微信二维码，必须提供二维码数据
-  if (isWechat && !qrCodeData) {
-    throw new Error('微信二维码必须提供原始二维码数据');
+  if (mapping.isWechat && !qrCodeData) {
+    throw new AppError('微信二维码必须提供原始二维码数据');
   }
 
   await DB.prepare(`
-    INSERT INTO mappings (path, target, name, expiry, enabled, isWechat, qrCodeData)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    UPDATE mappings
+    SET path = ?, target = ?, name = ?, expiry = ?, enabled = ?, isWechat = ?, qrCodeData = ?, announcementHtml = ?, hintHtml = ?, updated_at = ?
+    WHERE path = ?
   `).bind(
-    path,
-    target,
-    name || null,
-    expiry || null,
-    enabled ? 1 : 0,
-    isWechat ? 1 : 0,
-    qrCodeData
+    mapping.path,
+    mapping.target,
+    mapping.name,
+    mapping.expiry,
+    mapping.enabled ? 1 : 0,
+    mapping.isWechat ? 1 : 0,
+    qrCodeData,
+    mapping.announcementHtml,
+    mapping.hintHtml,
+    new Date().toISOString(),
+    originalPath
   ).run();
+
+  return getMappingByPath(mapping.path);
 }
 
 async function deleteMapping(path) {
-  if (!path || typeof path !== 'string') {
-    throw new Error('Invalid input');
+  const normalizedPath = normalizePath(path);
+  if (!normalizedPath) {
+    throw new AppError('短链名不能为空');
   }
-
-  // 检查是否在禁用列表中
-  if (banPath.includes(path)) {
-    throw new Error('系统保留的短链名无法删除');
+  if (RESERVED_PATHS.has(normalizedPath)) {
+    throw new AppError('系统保留的短链名无法删除');
   }
-
-  await DB.prepare('DELETE FROM mappings WHERE path = ?').bind(path).run();
+  const existing = await getMappingByPath(normalizedPath);
+  if (!existing) {
+    throw new AppError('映射不存在', 404, 'NOT_FOUND');
+  }
+  await DB.prepare('DELETE FROM mappings WHERE path = ?').bind(normalizedPath).run();
+  return existing;
 }
 
-async function updateMapping(originalPath, newPath, target, name, expiry, enabled = true, isWechat = false, qrCodeData = null) {
-  if (!originalPath || !newPath || !target) {
-    throw new Error('Invalid input');
+async function bulkDeleteMappings(paths) {
+  if (!Array.isArray(paths) || paths.length === 0) {
+    throw new AppError('请选择至少一个短链');
   }
+  const normalized = [...new Set(paths.map((item) => normalizePath(item)).filter(Boolean))];
+  const failures = [];
+  const removable = [];
 
-  // 检查新短链名是否在禁用列表中
-  if (banPath.includes(newPath)) {
-    throw new Error('该短链名已被系统保留，请使用其他名称');
-  }
-
-  if (expiry && isNaN(Date.parse(expiry))) {
-    throw new Error('Invalid expiry date');
-  }
-
-  // 如果没有提供新的二维码数据，获取原有的二维码数据
-  if (!qrCodeData && isWechat) {
-    const existingMapping = await DB.prepare(`
-      SELECT qrCodeData
-      FROM mappings
-      WHERE path = ?
-    `).bind(originalPath).first();
-
-    if (existingMapping) {
-      qrCodeData = existingMapping.qrCodeData;
+  for (const path of normalized) {
+    if (RESERVED_PATHS.has(path)) {
+      failures.push({ path, error: '系统保留的短链无法删除' });
+      continue;
     }
+    removable.push(path);
   }
 
-  // 如果是微信二维码，必须有二维码数据
-  if (isWechat && !qrCodeData) {
-    throw new Error('微信二维码必须提供原始二维码数据');
+  if (removable.length > 0) {
+    const placeholders = removable.map(() => '?').join(',');
+    await DB.prepare(`DELETE FROM mappings WHERE path IN (${placeholders})`).bind(...removable).run();
   }
 
-  const stmt = DB.prepare(`
-    UPDATE mappings 
-    SET path = ?, target = ?, name = ?, expiry = ?, enabled = ?, isWechat = ?, qrCodeData = ?
-    WHERE path = ?
-  `);
+  return {
+    deletedCount: removable.length,
+    deletedPaths: removable,
+    failures,
+  };
+}
 
-  await stmt.bind(
-    newPath,
-    target,
-    name || null,
-    expiry || null,
-    enabled ? 1 : 0,
-    isWechat ? 1 : 0,
-    qrCodeData,
-    originalPath
-  ).run();
+async function listMappings(filters) {
+  const { where, bindings } = buildFilterQuery(filters);
+  const sortBy = SORT_FIELD_MAP[filters.sortBy] || SORT_FIELD_MAP.created_at;
+  const sortOrder = filters.sortOrder === 'asc' ? 'ASC' : 'DESC';
+  const offset = (filters.page - 1) * filters.pageSize;
+
+  const totalResult = await DB.prepare(`SELECT COUNT(*) AS total FROM mappings WHERE ${where}`).bind(...bindings).first();
+  const rows = await DB.prepare(`
+    SELECT path, target, name, expiry, enabled, isWechat, qrCodeData, announcementHtml, hintHtml, visit_count, last_visited_at, created_at, updated_at
+    FROM mappings
+    WHERE ${where}
+    ORDER BY ${sortBy} ${sortOrder}, created_at DESC
+    LIMIT ? OFFSET ?
+  `).bind(...bindings, filters.pageSize, offset).all();
+
+  const items = (rows.results || []).map(serializeMapping);
+  const totalItems = Number(totalResult?.total || 0);
+  const totalPages = totalItems === 0 ? 0 : Math.ceil(totalItems / filters.pageSize);
+
+  return {
+    items,
+    pagination: {
+      page: filters.page,
+      pageSize: filters.pageSize,
+      totalItems,
+      totalPages,
+    },
+    summary: {
+      query: filters.query,
+      status: filters.status,
+      type: filters.type,
+      sortBy: filters.sortBy,
+      sortOrder: filters.sortOrder,
+      selectedCount: items.length,
+    },
+  };
 }
 
 async function getExpiringMappings() {
-  // 获取今天的日期（设置为今天的23:59:59）
-  const today = new Date();
-  today.setHours(23, 59, 59, 999);
-  const now = today.toISOString();
-  
-  // 获取今天的开始时间（00:00:00）
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-  const dayStart = todayStart.toISOString();
-  
-  // 修改为3天后的23:59:59
-  const threeDaysFromNow = new Date(todayStart);
-  threeDaysFromNow.setDate(todayStart.getDate() + 3);
-  threeDaysFromNow.setHours(23, 59, 59, 999);
-  const threeDaysLater = threeDaysFromNow.toISOString();
-
-  // 使用单个查询获取所有过期和即将过期的映射
-  const results = await DB.prepare(`
-    WITH categorized_mappings AS (
-      SELECT 
-        path, name, target, expiry, enabled, isWechat, qrCodeData,
-        CASE 
-          WHEN datetime(expiry) < datetime(?) THEN 'expired'
-          WHEN datetime(expiry) <= datetime(?) THEN 'expiring'
-        END as status
-      FROM mappings 
-      WHERE expiry IS NOT NULL 
-        AND datetime(expiry) <= datetime(?) 
-        AND enabled = 1
-    )
-    SELECT * FROM categorized_mappings
-    ORDER BY expiry ASC
-  `).bind(dayStart, threeDaysLater, threeDaysLater).all();
-
-  const mappings = {
-    expiring: [],
-    expired: []
+  const expiring = await listMappings({
+    page: 1,
+    pageSize: MAX_PAGE_SIZE,
+    query: '',
+    status: 'expiring',
+    type: 'all',
+    sortBy: 'expiry',
+    sortOrder: 'asc',
+  });
+  const expired = await listMappings({
+    page: 1,
+    pageSize: MAX_PAGE_SIZE,
+    query: '',
+    status: 'expired',
+    type: 'all',
+    sortBy: 'expiry',
+    sortOrder: 'asc',
+  });
+  return {
+    expiring: expiring.items,
+    expired: expired.items,
   };
-  
-  for (const row of results.results) {
-    const mapping = {
-      path: row.path,
-      name: row.name,
-      target: row.target,
-      expiry: row.expiry,
-      enabled: row.enabled === 1,
-      isWechat: row.isWechat === 1,
-      qrCodeData: row.qrCodeData
-    };
+}
 
-    if (row.status === 'expired') {
-      mappings.expired.push(mapping);
-    } else {
-      mappings.expiring.push(mapping);
+async function getDashboard() {
+  const today = getChinaDate();
+  const expiringLimit = getChinaDate(EXPIRING_DAYS);
+  const bindings = Array.from(RESERVED_PATHS);
+  const reservedPlaceholders = bindings.map(() => '?').join(',');
+
+  const stats = await DB.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS active_total,
+      SUM(CASE WHEN enabled = 0 THEN 1 ELSE 0 END) AS disabled_total,
+      SUM(CASE WHEN expiry IS NOT NULL AND substr(expiry, 1, 10) < ? THEN 1 ELSE 0 END) AS expired_total,
+      SUM(CASE WHEN enabled = 1 AND expiry IS NOT NULL AND substr(expiry, 1, 10) >= ? AND substr(expiry, 1, 10) <= ? THEN 1 ELSE 0 END) AS expiring_total,
+      SUM(CASE WHEN isWechat = 1 THEN 1 ELSE 0 END) AS wechat_total,
+      SUM(COALESCE(visit_count, 0)) AS visit_total
+    FROM mappings
+    WHERE path NOT IN (${reservedPlaceholders})
+  `).bind(today, today, expiringLimit, ...bindings).first();
+
+  const topVisited = await DB.prepare(`
+    SELECT path, target, name, expiry, enabled, isWechat, qrCodeData, announcementHtml, hintHtml, visit_count, last_visited_at, created_at, updated_at
+    FROM mappings
+    WHERE path NOT IN (${reservedPlaceholders})
+    ORDER BY visit_count DESC, updated_at DESC
+    LIMIT 5
+  `).bind(...bindings).all();
+
+  return {
+    total: Number(stats?.total || 0),
+    active: Number(stats?.active_total || 0),
+    disabled: Number(stats?.disabled_total || 0),
+    expiring: Number(stats?.expiring_total || 0),
+    expired: Number(stats?.expired_total || 0),
+    wechat: Number(stats?.wechat_total || 0),
+    visits: Number(stats?.visit_total || 0),
+    topVisited: (topVisited.results || []).map(serializeMapping),
+  };
+}
+
+async function exportMappings() {
+  const bindings = Array.from(RESERVED_PATHS);
+  const placeholders = bindings.map(() => '?').join(',');
+  const rows = await DB.prepare(`
+    SELECT path, target, name, expiry, enabled, isWechat, qrCodeData, announcementHtml, hintHtml, visit_count, last_visited_at, created_at, updated_at
+    FROM mappings
+    WHERE path NOT IN (${placeholders})
+    ORDER BY created_at DESC
+  `).bind(...bindings).all();
+  return (rows.results || []).map(serializeMapping);
+}
+
+async function importMappings(items) {
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new AppError('导入数据不能为空');
+  }
+
+  const failures = [];
+  let successCount = 0;
+
+  for (const item of items) {
+    try {
+      await createMapping(item, { includeMeta: true });
+      successCount += 1;
+    } catch (error) {
+      failures.push({
+        path: normalizePath(item?.path),
+        error: error instanceof Error ? error.message : '导入失败',
+      });
     }
   }
 
-  return mappings;
+  return {
+    successCount,
+    failureCount: failures.length,
+    failures,
+  };
 }
 
-// 添加新的批量清理过期映射的函数
-async function cleanupExpiredMappings(batchSize = 100) {
-  const now = new Date().toISOString();
-  
-  while (true) {
-    // 获取一批过期的映射
-    const batch = await DB.prepare(`
-      SELECT path 
-      FROM mappings 
-      WHERE expiry IS NOT NULL 
-        AND expiry < ? 
-      LIMIT ?
-    `).bind(now, batchSize).all();
+async function cleanupExpiredMappings() {
+  const cutoff = getChinaDate(-EXPIRED_RETENTION_DAYS);
+  const result = await DB.prepare(`
+    DELETE FROM mappings
+    WHERE expiry IS NOT NULL AND substr(expiry, 1, 10) < ?
+  `).bind(cutoff).run();
+  return Number(result.meta?.changes || 0);
+}
 
-    if (!batch.results || batch.results.length === 0) {
-      break;
-    }
+async function trackVisit(path) {
+  await DB.prepare(`
+    UPDATE mappings
+    SET visit_count = COALESCE(visit_count, 0) + 1,
+        last_visited_at = ?
+    WHERE path = ?
+  `).bind(new Date().toISOString(), path).run();
+}
 
-    // 批量删除这些映射
-    const paths = batch.results.map(row => row.path);
-    const placeholders = paths.map(() => '?').join(',');
-    await DB.prepare(`
-      DELETE FROM mappings 
-      WHERE path IN (${placeholders})
-    `).bind(...paths).run();
-
-    // 如果获取的数量小于 batchSize，说明已经处理完所有过期映射
-    if (batch.results.length < batchSize) {
-      break;
-    }
+async function readRequestJson(request) {
+  try {
+    return await request.json();
+  } catch {
+    throw new AppError('请求数据格式不正确');
   }
 }
 
-// 数据迁移函数
-async function migrateFromKV() {
-  let cursor = null;
-  do {
-    const listResult = await KV_BINDING.list({ cursor, limit: 1000 });
-    
-    for (const key of listResult.keys) {
-      if (!banPath.includes(key.name)) {
-        const value = await KV_BINDING.get(key.name, { type: "json" });
-        if (value) {
-          try {
-            await createMapping(
-              key.name,
-              value.target,
-              value.name,
-              value.expiry,
-              value.enabled,
-              value.isWechat,
-              value.qrCodeData
-            );
-          } catch (e) {
-            console.error(`Failed to migrate ${key.name}:`, e);
-          }
+async function serveAsset(request, env, url, path) {
+  if (!env.ASSETS || typeof env.ASSETS.fetch !== 'function') {
+    return new Response('Not Found', { status: 404 });
+  }
+  let targetUrl = new URL(request.url);
+  if (path === 'admin') {
+    targetUrl = new URL('/admin.html', url.origin);
+  } else if (path === 'login') {
+    targetUrl = new URL('/login.html', url.origin);
+  }
+  return env.ASSETS.fetch(new Request(targetUrl.toString(), request));
+}
+
+function shouldServeAssetFirst(path) {
+  return !path || path === 'admin' || path === 'login' || path.includes('.') || RESERVED_PATHS.has(path);
+}
+
+function createExpiredHtml(mapping) {
+  const title = escapeHtml(mapping.name ? `${mapping.name} 已过期` : '链接已过期');
+  const expiry = escapeHtml(mapping.expiry || '');
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${title}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; background: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .card { width: min(100%, 360px); padding: 28px 24px; text-align: center; background: #fff; border-radius: 18px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08); }
+    h1 { margin: 0 0 12px; font-size: 24px; color: #111827; }
+    p { margin: 8px 0; color: #6b7280; line-height: 1.6; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0f172a; }
+      .card { background: #111827; box-shadow: none; }
+      h1 { color: #f8fafc; }
+      p { color: #cbd5e1; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>${title}</h1>
+    <p>过期时间：${expiry || '未设置'}</p>
+    <p>如需继续访问，请联系管理员更新链接。</p>
+  </div>
+</body>
+</html>`;
+}
+
+function createWechatHtml(mapping) {
+  const title = escapeHtml(mapping.name || '微信群二维码');
+  const announcementHtml = sanitizeRichText(mapping.announcementHtml || mapping.announcement_html || '', DEFAULT_WECHAT_ANNOUNCEMENT_HTML);
+  const hintHtml = sanitizeRichText(mapping.hintHtml || mapping.hint_html || '', DEFAULT_WECHAT_HINT_HTML);
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${title}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; background: #f5f5f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .card { width: min(100%, 420px); padding: 28px 24px; text-align: center; background: #fff; border-radius: 18px; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08); }
+    .icon { width: 40px; height: 40px; margin-bottom: 12px; }
+    h1 { margin: 0 0 8px; font-size: 24px; color: #111827; }
+    .rich-text { color: #6b7280; line-height: 1.7; }
+    .rich-text :where(p, div, ul, ol) { margin: 10px 0 0; }
+    .rich-text :where(p, div, ul, ol):first-child { margin-top: 0; }
+    .rich-text :where(ul, ol) { padding-left: 1.4em; text-align: left; }
+    .rich-text :where(li + li) { margin-top: 0.35em; }
+    .rich-text a { color: #2563eb; text-decoration: underline; }
+    img.qr { width: 100%; max-width: 260px; margin: 18px auto 0; border-radius: 16px; display: block; background: #fff; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0f172a; }
+      .card { background: #111827; box-shadow: none; }
+      h1 { color: #f8fafc; }
+      .rich-text { color: #cbd5e1; }
+      .rich-text a { color: #93c5fd; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <img class="icon" src="/wechat.svg" alt="WeChat">
+    <h1>${title}</h1>
+    <div class="rich-text">${announcementHtml}</div>
+    <img class="qr" src="${escapeHtml(mapping.qrCodeData || '')}" alt="微信群二维码">
+    <div class="rich-text">${hintHtml}</div>
+  </div>
+</body>
+</html>`;
+}
+
+async function handleApi(request, env, ctx, url, path) {
+  if (path === 'api/login') {
+    if (request.method !== 'POST') {
+      return json({ error: 'Method Not Allowed' }, 405);
+    }
+    try {
+      const body = await readRequestJson(request);
+      if (String(body.password || '') !== String(env.PASSWORD || '')) {
+        throw new AppError('密码错误，请重试', 401, 'UNAUTHORIZED');
+      }
+      return json({ success: true }, 200, await setAuthCookie(env));
+    } catch (error) {
+      return errorResponse(error);
+    }
+  }
+
+  if (path === 'api/logout') {
+    if (request.method !== 'POST') {
+      return json({ error: 'Method Not Allowed' }, 405);
+    }
+    return json({ success: true }, 200, clearAuthCookie());
+  }
+
+  if (path === 'api/session') {
+    const authenticated = await verifyAuthCookie(request, env);
+    if (!authenticated) {
+      return json({ error: 'Unauthorized', authenticated: false }, 401);
+    }
+    return json({ authenticated: true });
+  }
+
+  if (!(await verifyAuthCookie(request, env))) {
+    return json({ error: 'Unauthorized' }, 401);
+  }
+
+  try {
+    if (path === 'api/dashboard' && request.method === 'GET') {
+      return json(await getDashboard());
+    }
+
+    if (path === 'api/expiring-mappings' && request.method === 'GET') {
+      return json(await getExpiringMappings());
+    }
+
+    if (path === 'api/mappings' && request.method === 'GET') {
+      return json(await listMappings(parseListParams(url.searchParams)));
+    }
+
+    if (path === 'api/mappings/export' && request.method === 'GET') {
+      const exported = await exportMappings();
+      const filename = `mappings-${getChinaDate().replace(/-/g, '')}.json`;
+      return new Response(JSON.stringify({ items: exported }, null, 2), {
+        headers: {
+          'Content-Type': 'application/json;charset=UTF-8',
+          'Content-Disposition': `attachment; filename="${filename}"`,
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+
+    if (path === 'api/mappings/import' && request.method === 'POST') {
+      const body = await readRequestJson(request);
+      const items = Array.isArray(body) ? body : body.items;
+      return json(await importMappings(items));
+    }
+
+    if (path === 'api/mappings/bulk-delete' && request.method === 'POST') {
+      const body = await readRequestJson(request);
+      return json(await bulkDeleteMappings(body.paths));
+    }
+
+    if (path === 'api/mapping') {
+      if (request.method === 'GET') {
+        const mappingPath = normalizePath(url.searchParams.get('path'));
+        if (!mappingPath) {
+          throw new AppError('缺少 path 参数');
         }
+        const mapping = await getMappingByPath(mappingPath);
+        if (!mapping) {
+          throw new AppError('映射不存在', 404, 'NOT_FOUND');
+        }
+        return json(mapping);
+      }
+
+      if (request.method === 'POST') {
+        return json(await createMapping(await readRequestJson(request)), 201);
+      }
+
+      if (request.method === 'PUT') {
+        return json(await updateMapping(await readRequestJson(request)));
+      }
+
+      if (request.method === 'DELETE') {
+        const body = await readRequestJson(request);
+        return json(await deleteMapping(body.path));
       }
     }
-    
-    cursor = listResult.cursor;
-  } while (cursor);
+
+    return json({ error: 'Not Found' }, 404);
+  } catch (error) {
+    return errorResponse(error);
+  }
+}
+
+async function handleMappingRequest(path, env, ctx) {
+  const mapping = await getMappingByPath(path);
+  if (!mapping) {
+    return null;
+  }
+
+  if (!mapping.enabled) {
+    return new Response('Not Found', { status: 404 });
+  }
+
+  if (mapping.expiry && isExpiredDate(mapping.expiry)) {
+    return new Response(createExpiredHtml(mapping), {
+      status: 404,
+      headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' },
+    });
+  }
+
+  ctx.waitUntil(trackVisit(path));
+
+  if (mapping.isWechat && mapping.qrCodeData) {
+    return new Response(createWechatHtml(mapping), {
+      headers: { 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'no-store' },
+    });
+  }
+
+  return Response.redirect(mapping.target, 302);
 }
 
 export default {
-  async fetch(request, env) {
-    KV_BINDING = env.KV_BINDING;
+  async fetch(request, env, ctx) {
     DB = env.DB;
-    
-    // 初始化数据库
     await initDatabase();
-    
+
     const url = new URL(request.url);
-    const path = url.pathname.slice(1);
+    const path = normalizePath(url.pathname);
 
-    // 根目录跳转到 管理后台
-    if (path === '') {
-      return Response.redirect(url.origin + '/admin.html', 302);
+    if (!path) {
+      return Response.redirect(`${url.origin}/admin`, 302);
     }
 
-    // API 路由处理
     if (path.startsWith('api/')) {
-      // 登录 API
-      if (path === 'api/login' && request.method === 'POST') {
-        const { password } = await request.json();
-        if (password === env.PASSWORD) {
-          return new Response(JSON.stringify({ success: true }), {
-            headers: setAuthCookie(password)
-          });
-        }
-        return new Response('Unauthorized', { status: 401 });
-      }
-
-      // 登出 API
-      if (path === 'api/logout' && request.method === 'POST') {
-        return new Response(JSON.stringify({ success: true }), {
-          headers: clearAuthCookie()
-        });
-      }
-
-      // 需要认证的 API
-      if (!verifyAuthCookie(request, env)) {
-        return new Response('Unauthorized', { status: 401 });
-      }
-
-      try {
-        // 获取即将过期和已过期的映射
-        if (path === 'api/expiring-mappings') {
-          const result = await getExpiringMappings();
-          return new Response(JSON.stringify(result), {
-            headers: { 'Content-Type': 'application/json' }
-          });
-        }
-
-        // 获取映射列表
-        if (path === 'api/mappings') {
-          const params = new URLSearchParams(url.search);
-          const page = parseInt(params.get('page')) || 1;
-          const pageSize = parseInt(params.get('pageSize')) || 10;
-
-          const result = await listMappings(page, pageSize);
-          return new Response(JSON.stringify(result), {
-            headers: { 'Content-Type': 'application/json' }
-          });
-        }
-
-        // 映射管理 API
-        if (path === 'api/mapping') {
-          // 获取单个映射
-          if (request.method === 'GET') {
-            const params = new URLSearchParams(url.search);
-            const mappingPath = params.get('path');
-            if (!mappingPath) {
-              return new Response(JSON.stringify({ error: 'Missing path parameter' }), {
-                status: 400,
-                headers: { 'Content-Type': 'application/json' }
-              });
-            }
-
-            const mapping = await DB.prepare(`
-              SELECT path, target, name, expiry, enabled, isWechat, qrCodeData
-              FROM mappings
-              WHERE path = ?
-            `).bind(mappingPath).first();
-            if (!mapping) {
-              return new Response(JSON.stringify({ error: 'Mapping not found' }), {
-                status: 404,
-                headers: { 'Content-Type': 'application/json' }
-              });
-            }
-
-            return new Response(JSON.stringify(mapping), {
-              headers: { 'Content-Type': 'application/json' }
-            });
-          }
-
-          // 创建映射
-          if (request.method === 'POST') {
-            const data = await request.json();
-            await createMapping(data.path, data.target, data.name, data.expiry, data.enabled, data.isWechat, data.qrCodeData);
-            return new Response(JSON.stringify({ success: true }), {
-              headers: { 'Content-Type': 'application/json' }
-            });
-          }
-
-          // 更新映射
-          if (request.method === 'PUT') {
-            const data = await request.json();
-            await updateMapping(
-              data.originalPath,
-              data.path,
-              data.target,
-              data.name,
-              data.expiry,
-              data.enabled,
-              data.isWechat,
-              data.qrCodeData
-            );
-            return new Response(JSON.stringify({ success: true }), {
-              headers: { 'Content-Type': 'application/json' }
-            });
-          }
-
-          // 删除映射
-          if (request.method === 'DELETE') {
-            const { path } = await request.json();
-            await deleteMapping(path);
-            return new Response(JSON.stringify({ success: true }), {
-              headers: { 'Content-Type': 'application/json' }
-            });
-          }
-        }
-
-        return new Response('Not Found', { status: 404 });
-      } catch (error) {
-        console.error('API operation error:', error);
-        return new Response(JSON.stringify({
-          error: error.message || 'Internal Server Error'
-        }), {
-          status: error.message === 'Invalid input' ? 400 : 500,
-          headers: { 'Content-Type': 'application/json' }
-        });
-      }
+      return handleApi(request, env, ctx, url, path);
     }
 
-    // URL 重定向处理
-    if (path) {
-      try {
-        const mapping = await DB.prepare(`
-          SELECT path, target, name, expiry, enabled, isWechat, qrCodeData
-          FROM mappings
-          WHERE path = ?
-        `).bind(path).first();
-        if (mapping) {
-          // 检查是否启用
-          if (!mapping.enabled) {
-            return new Response('Not Found', { status: 404 });
-          }
-
-          // 检查是否过期 - 使用当天23:59:59作为失效判断时间
-          if (mapping.expiry) {
-            const today = new Date();
-            today.setHours(23, 59, 59, 999);
-            if (new Date(mapping.expiry) < today) {
-              const expiredHtml = `<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>链接已过期</title>
-    <style>
-        :root {
-            color-scheme: light dark;
-        }
-        body {
-            margin: 0;
-            padding: 16px;
-            min-height: 100vh;
-            display: flex;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f7f7f7;
-            box-sizing: border-box;
-        }
-        .container {
-            margin: auto;
-            padding: 24px 16px;
-            width: calc(100% - 32px);
-            max-width: 320px;
-            text-align: center;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        }
-        .title {
-            font-size: 22px;
-            font-weight: 600;
-            margin: 0 0 16px;
-            color: #333;
-        }
-        .message {
-            font-size: 16px;
-            color: #666;
-            margin: 16px 0;
-            line-height: 1.5;
-        }
-        .info {
-            font-size: 14px;
-            color: #999;
-            margin-top: 20px;
-        }
-        @media (prefers-color-scheme: dark) {
-            body {
-                background: #1a1a1a;
-            }
-            .container {
-                background: #2a2a2a;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-            }
-            .title {
-                color: #e0e0e0;
-            }
-            .message {
-                color: #aaa;
-            }
-            .info {
-                color: #777;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1 class="title">${mapping.name ? mapping.name + ' 已过期' : '链接已过期'}</h1>
-        <p class="info">过期时间：${new Date(mapping.expiry).toLocaleDateString()}</p>
-        <p class="info">如需访问，请联系管理员更新链接</p>
-    </div>
-</body>
-</html>`;
-              return new Response(expiredHtml, {
-                status: 404,
-                headers: {
-                  'Content-Type': 'text/html;charset=UTF-8',
-                  'Cache-Control': 'no-store'
-                }
-              });
-            }
-          }
-
-          // 如果是微信二维码，返回活码页面
-          if (mapping.isWechat === 1 && mapping.qrCodeData) {
-            const wechatHtml = `<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${mapping.name || '微信群二维码'}</title>
-    <style>
-        :root {
-            color-scheme: light dark;
-        }
-        body {
-            margin: 0;
-            padding: 16px;
-            min-height: 100vh;
-            display: flex;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f7f7f7;
-            box-sizing: border-box;
-        }
-        .container {
-            margin: auto;
-            padding: 24px 16px;
-            width: calc(100% - 32px);
-            max-width: 320px;
-            text-align: center;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
-        }
-        .wechat-icon {
-            width: 32px;
-            height: 32px;
-            margin-bottom: 12px;
-        }
-        .title {
-            font-size: 22px;
-            font-weight: 600;
-            margin: 0 0 8px;
-            color: #333;
-        }
-        .qr-code {
-            width: 100%;
-            max-width: 240px;
-            border-radius: 8px;
-            margin: 20px 0;
-        }
-        .notice {
-            font-size: 16px;
-            color: #666;
-            margin: 16px 0 0;
-            line-height: 1.5;
-        }
-        .footer {
-            font-size: 14px;
-            color: #999;
-            margin-top: 20px;
-        }
-
-        @media (prefers-color-scheme: dark) {
-            body {
-                background: #1a1a1a;
-            }
-            .container {
-                background: #2a2a2a;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.2);
-            }
-            .title {
-                color: #e0e0e0;
-            }
-            .notice {
-                color: #aaa;
-            }
-            .footer {
-                color: #777;
-            }
-            .qr-code {
-                background: white;
-                padding: 8px;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <img class="wechat-icon" src="wechat.svg" alt="WeChat">
-        <h1 class="title">${mapping.name ? mapping.name : '微信二维码'}</h1>
-        <p class="notice">请长按识别下方二维码</p>
-        <img class="qr-code" src="${mapping.qrCodeData}" alt="微信群二维码">
-        <p class="footer">二维码失效请联系作者更新</p>
-    </div>
-</body>
-</html>`;
-            return new Response(wechatHtml, {
-              headers: {
-                'Content-Type': 'text/html;charset=UTF-8',
-                'Cache-Control': 'no-store'
-              }
-            });
-          }
-
-          // 如果不是微信二维码，执行普通重定向
-          return Response.redirect(mapping.target, 302);
-        }
-        return new Response('Not Found', { status: 404 });
-      } catch (error) {
-        console.error('Redirect error:', error);
-        return new Response('Internal Server Error', { status: 500 });
-      }
+    if (shouldServeAssetFirst(path)) {
+      return serveAsset(request, env, url, path);
     }
+
+    const mappingResponse = await handleMappingRequest(path, env, ctx);
+    if (mappingResponse) {
+      return mappingResponse;
+    }
+
+    return serveAsset(request, env, url, path);
   },
 
-  async scheduled(controller, env, ctx) {
-    KV_BINDING = env.KV_BINDING;
+  async scheduled(controller, env) {
     DB = env.DB;
-    
-    // 初始化数据库
     await initDatabase();
-        
-    // 获取过期和即将过期的映射报告
-    const result = await getExpiringMappings();
-
-    console.log(`Cron job report: Found ${result.expired.length} expired mappings`);
-    if (result.expired.length > 0) {
-      console.log('Expired mappings:', JSON.stringify(result.expired, null, 2));
-    }
-
-    console.log(`Found ${result.expiring.length} mappings expiring in 2 days`);
-    if (result.expiring.length > 0) {
-      console.log('Expiring soon mappings:', JSON.stringify(result.expiring, null, 2));
-    }
+    const expiring = await getExpiringMappings();
+    const cleanedCount = await cleanupExpiredMappings();
+    console.log(JSON.stringify({
+      expiringCount: expiring.expiring.length,
+      expiredCount: expiring.expired.length,
+      cleanedCount,
+    }));
   },
-
 };
